@@ -29,6 +29,8 @@
 #include "leds.h"
 #include <linux/debugfs.h>
 #include <linux/uaccess.h>
+#include <linux/gpio.h>
+#include <linux/of_gpio.h>
 
 #define FLASH_LED_PERIPHERAL_SUBTYPE(base)			(base + 0x05)
 #define FLASH_SAFETY_TIMER(base)				(base + 0x40)
@@ -132,6 +134,10 @@
 #define FLASH_SUBTYPE_DUAL					0x01
 #define FLASH_SUBTYPE_SINGLE					0x02
 
+extern uint32_t get_camera_id(void);
+#undef CDBG
+#define CDBG(fmt, args...) pr_err(fmt, ##args)
+
 /*
  * ID represents physical LEDs for individual control purpose.
  */
@@ -139,6 +145,7 @@ enum flash_led_id {
 	FLASH_LED_0 = 0,
 	FLASH_LED_1,
 	FLASH_LED_SWITCH,
+	FLASH_LED_FRONT,
 };
 
 enum flash_led_type {
@@ -220,6 +227,8 @@ struct flash_led_platform_data {
 	bool				mask3_en;
 	bool				follow_rb_disable;
 	bool				die_current_derate_en;
+	unsigned front_flash_gpio_mode;
+	unsigned front_flash_gpio_en;
 };
 
 struct qpnp_flash_led_buffer {
@@ -1231,7 +1240,6 @@ error_regulator_enable:
 
 	return rc;
 }
-
 static void qpnp_flash_led_work(struct work_struct *work)
 {
 	struct flash_node_data *flash_node = container_of(work,
@@ -1242,10 +1250,52 @@ static void qpnp_flash_led_work(struct work_struct *work)
 	int rc, brightness = flash_node->cdev.brightness;
 	int max_curr_avail_ma = 0;
 	int total_curr_ma = 0;
+	// int camera_id = 0;
 	int i;
 	u8 val;
 
+/*
+	flash_node->id = get_camera_id();
+	if (flash_node->id == 0)
+		flash_node->trigger = 0x80;
+	else	if(flash_node->id == 1)
+		flash_node->trigger = 0x40;
+*/
+/*	#ifdef CONFIG_PROJECT_P7201
+	camera_id = get_camera_id();
+	CDBG("[DEBUG CAMERA] camera_id is %i", camera_id);
+	if (camera_id == 1)
+		flash_node->id = FLASH_LED_FRONT;
+	else
+		flash_node->id = FLASH_LED_1;
+	#endif
+*/
 	mutex_lock(&led->flash_led_lock);
+	if (flash_node->id == FLASH_LED_FRONT) {
+		if (!brightness) {
+			if (gpio_is_valid(led->pdata->front_flash_gpio_en))
+				gpio_set_value(led->pdata->front_flash_gpio_en, 0);
+			if (gpio_is_valid(led->pdata->front_flash_gpio_mode))
+				gpio_set_value(led->pdata->front_flash_gpio_mode, 0);
+			flash_node->flash_on = false;
+			mutex_unlock(&led->flash_led_lock);
+			return;
+		}
+		if (flash_node->type == TORCH) {
+			if (gpio_is_valid(led->pdata->front_flash_gpio_en))
+				gpio_set_value(led->pdata->front_flash_gpio_en, 1);
+			if (gpio_is_valid(led->pdata->front_flash_gpio_mode))
+				gpio_set_value(led->pdata->front_flash_gpio_mode, 0);
+		} else {
+			if (gpio_is_valid(led->pdata->front_flash_gpio_en))
+				gpio_set_value(led->pdata->front_flash_gpio_en, 1);
+			if (gpio_is_valid(led->pdata->front_flash_gpio_mode))
+				gpio_set_value(led->pdata->front_flash_gpio_mode, 1);
+		}
+		flash_node->flash_on = true;
+		mutex_unlock(&led->flash_led_lock);
+		return;
+	}
 
 	if (!brightness)
 		goto turn_off;
@@ -1276,6 +1326,7 @@ static void qpnp_flash_led_work(struct work_struct *work)
 	}
 
 	if (led->dbg_feature_en) {
+
 		rc = qpnp_led_masked_write(led->spmi_dev,
 						INT_SET_TYPE(led->base),
 						FLASH_STATUS_REG_MASK, 0x1F);
@@ -1333,6 +1384,10 @@ static void qpnp_flash_led_work(struct work_struct *work)
 		}
 
 		if (flash_node->id == FLASH_LED_SWITCH) {
+			#if defined(CONFIG_PROJECT_P7201)
+				if(flash_node->prgm_current)
+					flash_node->prgm_current = 150;
+			#endif
 			val = (u8)(flash_node->prgm_current *
 						FLASH_TORCH_MAX_LEVEL
 						/ flash_node->max_current);
@@ -1344,7 +1399,10 @@ static void qpnp_flash_led_work(struct work_struct *work)
 					"Torch reg write failed\n");
 				goto exit_flash_led_work;
 			}
-
+	    #if defined(CONFIG_PROJECT_P7201)
+				if(flash_node->prgm_current2)
+					flash_node->prgm_current2 = 150;
+			#endif
 			val = (u8)(flash_node->prgm_current2 *
 						FLASH_TORCH_MAX_LEVEL
 						/ flash_node->max_current);
@@ -1398,7 +1456,6 @@ static void qpnp_flash_led_work(struct work_struct *work)
 				"Module enable reg write failed\n");
 			goto exit_flash_led_work;
 		}
-
 		if (led->pdata->hdrm_sns_ch0_en ||
 						led->pdata->hdrm_sns_ch1_en) {
 			if (flash_node->id == FLASH_LED_SWITCH) {
@@ -1529,7 +1586,10 @@ static void qpnp_flash_led_work(struct work_struct *work)
 					(flash_node->prgm_current2 *
 					max_curr_avail_ma) / total_curr_ma;
 			}
-
+		    #if defined(CONFIG_PROJECT_P7201)
+					if(flash_node->prgm_current)
+					    flash_node->prgm_current = 750;
+		    #endif
 			val = (u8)(flash_node->prgm_current *
 				FLASH_MAX_LEVEL / flash_node->max_current);
 			rc = qpnp_led_masked_write(led->spmi_dev,
@@ -1539,11 +1599,16 @@ static void qpnp_flash_led_work(struct work_struct *work)
 					"Current register write failed\n");
 				goto exit_flash_led_work;
 			}
-
+		    #if  defined(CONFIG_PROJECT_P7201)
+					if(flash_node->prgm_current2)
+					    flash_node->prgm_current2 = 750;
+		    #endif
 			val = (u8)(flash_node->prgm_current2 *
 				FLASH_MAX_LEVEL / flash_node->max_current);
+
 			rc = qpnp_led_masked_write(led->spmi_dev,
 				led->current2_addr, FLASH_CURRENT_MASK, val);
+
 			if (rc) {
 				dev_err(&led->spmi_dev->dev,
 					"Current register write failed\n");
@@ -1736,8 +1801,6 @@ turn_off:
 				"Failed to read out fault status register\n");
 			goto exit_flash_led_work;
 		}
-
-		led->open_fault |= (val & FLASH_LED_OPEN_FAULT_DETECTED);
 	}
 
 	rc = qpnp_led_masked_write(led->spmi_dev,
@@ -2418,6 +2481,28 @@ static int qpnp_flash_led_parse_common_dt(
 			return PTR_ERR(led->gpio_state_suspend);
 		}
 	}
+
+		led->pdata->front_flash_gpio_mode = of_get_named_gpio(node,
+						"qcom,front_flash_gpio_mode", 0);
+		rc = gpio_direction_output(led->pdata->front_flash_gpio_mode, 1);
+		if (rc) {
+			pr_err("%s: Failed to set gpio %d\n", __func__,
+		       led->pdata->front_flash_gpio_mode);
+			gpio_free(led->pdata->front_flash_gpio_mode);
+			return -EINVAL;
+		}
+		gpio_set_value(led->pdata->front_flash_gpio_mode, 0);
+
+		led->pdata->front_flash_gpio_en = of_get_named_gpio(node,
+						"qcom,front_flash_gpio_en", 0);
+		rc = gpio_direction_output(led->pdata->front_flash_gpio_en, 1);
+		if (rc) {
+			pr_err("%s: Failed to set gpio %d\n", __func__,
+		       led->pdata->front_flash_gpio_en);
+			gpio_free(led->pdata->front_flash_gpio_en);
+			return -EINVAL;
+		}
+		gpio_set_value(led->pdata->front_flash_gpio_en, 0);
 
 	return 0;
 }
